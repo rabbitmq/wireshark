@@ -1,0 +1,9 @@
+VMware, Inc. has released under Apache 2.0 license this plugin for Wireshark.
+It decodes the protocol used by the Osiris Erlang library [1], itself used in
+RabbitMQ [2] initially.
+
+The plugin decodes the communication protocol, but not any data payload inside
+the chunk entries.
+
+[1] https://github.com/rabbitmq/osiris/
+[2] https://www.rabbitmq.com/
