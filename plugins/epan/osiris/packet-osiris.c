@@ -22,7 +22,6 @@
 #include <epan/expert.h>
 #include <epan/crc32-tvb.h>
 #include <epan/dissectors/packet-tcp.h>
-#include "packet-osiris.h"
 
 #define OSIRIS_TCP_PORT_RANGE "6000-6500" /* Not IANA registed */
 
