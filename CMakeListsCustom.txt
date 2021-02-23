@@ -13,6 +13,7 @@
 # Fail CMake stage if any of these plugins are missing from source tree
 set(CUSTOM_PLUGIN_SRC_DIR
 	plugins/epan/osiris
+	plugins/epan/rabbitmq-stream
 )
 
 #

@@ -1,0 +1,4 @@
+VMware, Inc. has released under Apache 2.0 license this plugin for Wireshark.
+It decodes the RabbitMQ Stream protocol used in RabbitMQ [1].
+
+[1] https://github.com/rabbitmq/rabbitmq-server/blob/master/deps/rabbitmq_stream/docs/PROTOCOL.adoc
