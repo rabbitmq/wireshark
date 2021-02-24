@@ -151,7 +151,8 @@ dissect_osiris_chunk_header(tvbuff_t *tvb, packet_info *pinfo,
         offset += 1;
         break;
     default:
-        expert_add_info(pinfo, chunk_type_item, &ei_osiris_invalid_chunk_type);
+        expert_add_info(pinfo, chunk_type_item,
+            &ei_osiris_invalid_chunk_type);
         return -1;
     }
 
