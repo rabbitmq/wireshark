@@ -14,8 +14,6 @@
  *
  */
 
-#include "config.h"
-
 #include <stdio.h> // FIXME
 
 #include <epan/packet.h>
@@ -23,12 +21,15 @@
 #include <epan/crc32-tvb.h>
 #include <epan/dissectors/packet-tcp.h>
 
+#include <wsutil/str_util.h>
+
 #define OSIRIS_TCP_PORT_RANGE "6000-6500" /* Not IANA registed */
 
 #define OSIRIS_SEGMENT_FILE_HEADER_LENGTH 8
 #define OSIRIS_CHUNK_HEADER_LENGTH 44
 
-static int proto_osiris = -1;
+static int proto_osiris_chunk = -1;
+static int proto_osiris_log_file = -1;
 
 static int hf_osiris_magic = -1;
 static int hf_osiris_version = -1;
@@ -58,12 +59,18 @@ static int hf_osiris_subbatch_num_records = -1;
 
 static int hf_osiris_trailer_writer_id_size = -1;
 static int hf_osiris_trailer_writer_id = -1;
-static int hf_osiris_trailer_timestamp = -1;
 static int hf_osiris_trailer_sequence = -1;
+
+static int hf_osiris_log_magic = -1;
+static int hf_osiris_log_version = -1;
 
 static expert_field ei_osiris_invalid_chunk_type = EI_INIT;
 static expert_field ei_osiris_invalid_entry_type = EI_INIT;
+static expert_field ei_osiris_invalid_entry_type_for_chunk_type = EI_INIT;
+static expert_field ei_osiris_chunk_content_overflow = EI_INIT;
 static expert_field ei_osiris_crc_mismatch = EI_INIT;
+static expert_field ei_osiris_unknown_entry_content = EI_INIT;
+static expert_field ei_osiris_inconsistent_chunk_size = EI_INIT;
 
 static gint ett_osiris = -1;
 static gint ett_osiris_chunk_header = -1;
@@ -71,6 +78,9 @@ static gint ett_osiris_entries = -1;
 static gint ett_osiris_entry = -1;
 static gint ett_osiris_tracking_entry = -1;
 static gint ett_osiris_trailer = -1;
+static gint ett_osiris_trailer_entry = -1;
+
+static gint ett_osiris_log = -1;
 
 enum chunk_types {
     CHUNK_TYPE_USER = 0,
@@ -97,6 +107,7 @@ static const value_string entry_type_names[] = {
 };
 
 struct osiris_chunk_header {
+    guint starting_offset;
     guint version;
     enum chunk_types chunk_type;
     guint num_entries;
@@ -179,8 +190,7 @@ dissect_osiris_chunk_header(tvbuff_t *tvb, packet_info *pinfo,
         hf_osiris_trailer_length, tvb, offset, 4, ENC_BIG_ENDIAN, &trailer_length);
     offset += 4;
 
-    actual_chunk_crc = crc32_ccitt_tvb_offset(tvb, offset,
-        data_length + trailer_length);
+    actual_chunk_crc = crc32_ccitt_tvb_offset(tvb, offset, data_length);
     if (chunk_crc != actual_chunk_crc) {
         expert_add_info(pinfo, chunk_crc_item, &ei_osiris_crc_mismatch);
     }
@@ -192,21 +202,28 @@ static int
 dissect_osiris_tracking_entry(tvbuff_t *tvb, packet_info *pinfo _U_,
     proto_tree *tree, int offset, struct osiris_chunk_header *header)
 {
-    guint32 id_size, entry_size;
+    guint32 id_size, entry_size, remaining_bytes;
 
     id_size = tvb_get_guint8(tvb, offset);
     entry_size = 1 + id_size + 8;
-    /* TODO: Assert remaining data length. */
+    remaining_bytes = header->starting_offset + OSIRIS_CHUNK_HEADER_LENGTH +
+        header->data_length - offset;
 
     proto_tree *entry_tree = proto_tree_add_subtree_format(tree, tvb,
-        offset, entry_size, ett_osiris_tracking_entry, NULL,
-        "%s",
+        offset, MIN(entry_size, remaining_bytes), ett_osiris_tracking_entry,
+        NULL, "%s",
         val_to_str(header->chunk_type, chunk_type_names,
         "Unknown tracking entry (0x%02x)"));
 
-    proto_tree_add_item(entry_tree,
+    proto_item *entry_id_size_item = proto_tree_add_item(entry_tree,
         hf_osiris_tracking_entry_id_size, tvb, offset, 1, ENC_BIG_ENDIAN);
     offset += 1;
+
+    if (entry_size > remaining_bytes) {
+        expert_add_info(pinfo, entry_id_size_item,
+            &ei_osiris_chunk_content_overflow);
+        return -1;
+    }
 
     proto_tree_add_item(entry_tree,
         hf_osiris_tracking_entry_id, tvb, offset, id_size,
@@ -225,13 +242,15 @@ static int
 dissect_osiris_writers_snapshot_entry(tvbuff_t *tvb, packet_info *pinfo _U_,
     proto_tree *tree, int offset, struct osiris_chunk_header *header)
 {
-    guint8 writer_id_size, entry_size;
+    guint8 writer_id_size;
+    guint32 entry_size, remaining_bytes;
     guint64 timestamp;
     nstime_t tv;
 
     writer_id_size = tvb_get_guint8(tvb, offset);
     entry_size = 1 + writer_id_size + 8 + 8;
-    /* TODO: Assert entry length. */
+    remaining_bytes = header->starting_offset + OSIRIS_CHUNK_HEADER_LENGTH +
+        header->data_length - offset;
 
     proto_tree *entry_tree = proto_tree_add_subtree_format(tree, tvb,
         offset, entry_size, ett_osiris_tracking_entry, NULL,
@@ -239,9 +258,15 @@ dissect_osiris_writers_snapshot_entry(tvbuff_t *tvb, packet_info *pinfo _U_,
         val_to_str(header->chunk_type, chunk_type_names,
         "Unknown tracking entry (0x%02x)"));
 
-    proto_tree_add_item(entry_tree,
+    proto_item *writer_id_size_item = proto_tree_add_item(entry_tree,
         hf_osiris_writer_snap_writer_id_size, tvb, offset, 1, ENC_BIG_ENDIAN);
     offset += 1;
+
+    if (entry_size > remaining_bytes) {
+        expert_add_info(pinfo, writer_id_size_item,
+            &ei_osiris_chunk_content_overflow);
+        return -1;
+    }
 
     proto_tree_add_item(entry_tree,
         hf_osiris_writer_snap_writer_id, tvb, offset, writer_id_size,
@@ -269,9 +294,12 @@ dissect_osiris_entry(tvbuff_t *tvb, packet_info *pinfo,
 {
     enum entry_types entry_type;
     int ret, unknown_entry_type = 0;
-    guint32 data_size, entry_size;
+    guint32 data_size, entry_size, remaining_bytes;
+    proto_item *entry_data_item;
 
     entry_type = (enum entry_types)tvb_get_bits8(tvb, offset * 8, 1);
+    remaining_bytes = header->starting_offset + OSIRIS_CHUNK_HEADER_LENGTH +
+        header->data_length - offset;
 
     switch (entry_type) {
     case ENTRY_TYPE_SIMPLE:
@@ -288,14 +316,13 @@ dissect_osiris_entry(tvbuff_t *tvb, packet_info *pinfo,
         unknown_entry_type = 1;
         break;
     }
-    /* TODO: Assert remaining data length. */
 
     proto_tree *entry_tree = proto_tree_add_subtree_format(tree, tvb,
         offset, entry_size, ett_osiris_entry, NULL,
-        "Entry #%u, type %s, %u bytes of data",
+        "Entry #%u, type %s, %u byte%s of data",
         entry_idx,
         val_to_str(entry_type, entry_type_names, "unknown (0x%02x)"),
-        data_size);
+        data_size, plurality(data_size, "", "s"));
 
     proto_item *entry_type_item = proto_tree_add_bits_item(entry_tree,
         hf_osiris_entry_type, tvb, offset * 8, 1, ENC_BIG_ENDIAN);
@@ -303,6 +330,10 @@ dissect_osiris_entry(tvbuff_t *tvb, packet_info *pinfo,
     if (unknown_entry_type) {
         expert_add_info(pinfo, entry_type_item,
             &ei_osiris_invalid_entry_type);
+        return -1;
+    } else if (entry_size > remaining_bytes) {
+        expert_add_info(pinfo, entry_type_item,
+            &ei_osiris_chunk_content_overflow);
         return -1;
     }
 
@@ -347,14 +378,22 @@ dissect_osiris_entry(tvbuff_t *tvb, packet_info *pinfo,
                 } while (data_size > 0);
                 break;
             default:
-                /* TODO: Add fallback code. */
-                break;
+                entry_data_item = proto_tree_add_item(entry_tree,
+                    hf_osiris_entry_data, tvb, offset, data_size,
+                    ENC_BIG_ENDIAN);
+                offset += data_size;
+
+                expert_add_info(pinfo, entry_data_item,
+                    &ei_osiris_unknown_entry_content);
             }
         }
 
         break;
     case ENTRY_TYPE_SUBBATCH:
-        /* TODO: Assert chunk type id user. */
+        if (header->chunk_type != CHUNK_TYPE_USER) {
+            expert_add_info(pinfo, entry_type_item,
+                &ei_osiris_invalid_entry_type_for_chunk_type);
+        }
 
         proto_tree_add_bits_item(entry_tree,
             hf_osiris_subbatch_compression_type, tvb, offset * 8 + 1, 3,
@@ -392,11 +431,11 @@ dissect_osiris_entries(tvbuff_t *tvb, packet_info *pinfo,
 
     proto_tree *entries_tree = proto_tree_add_subtree_format(tree, tvb,
         offset, header->data_length, ett_osiris_entries, NULL,
-        "Entries (%u entries)", header->num_entries);
+        "Entries (%u entr%s)", header->num_entries,
+        plurality(header->num_entries, "y", "ies"));
 
     data_length = header->data_length;
     for (guint i = 0; i < header->num_entries; ++i) {
-        /* TODO: Assert remaining data length. */
         ret = dissect_osiris_entry(tvb, pinfo, entries_tree,
             offset, header, i);
         if (ret < 0) {
@@ -411,38 +450,64 @@ dissect_osiris_entries(tvbuff_t *tvb, packet_info *pinfo,
 }
 
 static int
-dissect_osiris_trailer(tvbuff_t *tvb, packet_info *pinfo _U_,
+dissect_osiris_trailer_entry(tvbuff_t *tvb, packet_info *pinfo _U_,
     proto_tree *tree, int offset, struct osiris_chunk_header *header)
 {
     guint8 writer_id_size;
-    guint64 timestamp;
-    nstime_t tv;
+    guint32 entry_size, remaining_bytes;
 
     writer_id_size = tvb_get_guint8(tvb, offset);
-    /* TODO: Assert trailer length. */
+    entry_size = 1 + writer_id_size + 8;
+    remaining_bytes = header->starting_offset + OSIRIS_CHUNK_HEADER_LENGTH +
+        header->data_length + header->trailer_length - offset;
 
-    proto_tree *trailer_tree = proto_tree_add_subtree(tree, tvb, offset,
-        header->trailer_length, ett_osiris_trailer, NULL, "Trailer");
+    proto_tree *entry_tree = proto_tree_add_subtree(tree, tvb, offset,
+        MIN(entry_size, remaining_bytes), ett_osiris_trailer_entry, NULL,
+        "Trailer entry");
 
-    proto_tree_add_item(trailer_tree,
+    proto_item *writer_id_size_item = proto_tree_add_item(entry_tree,
         hf_osiris_trailer_writer_id_size, tvb, offset, 1, ENC_BIG_ENDIAN);
     offset += 1;
 
-    proto_tree_add_item(trailer_tree,
+    if (entry_size > remaining_bytes) {
+        expert_add_info(pinfo, writer_id_size_item,
+            &ei_osiris_chunk_content_overflow);
+        return -1;
+    }
+
+    proto_tree_add_item(entry_tree,
         hf_osiris_trailer_writer_id, tvb, offset, writer_id_size,
         ENC_BIG_ENDIAN);
     offset += writer_id_size;
 
-    timestamp = tvb_get_ntoh64(tvb, offset); // In milliseconds.
-    tv.secs = timestamp / 1000;
-    tv.nsecs = (timestamp % 1000) * 1000 * 1000;
-    proto_tree_add_time(trailer_tree,
-        hf_osiris_trailer_timestamp, tvb, offset, 8, &tv);
-    offset += 8;
-
-    proto_tree_add_item(trailer_tree,
+    proto_tree_add_item(entry_tree,
         hf_osiris_trailer_sequence, tvb, offset, 8, ENC_BIG_ENDIAN);
     offset += 8;
+
+    return offset;
+}
+
+static int
+dissect_osiris_trailer(tvbuff_t *tvb, packet_info *pinfo,
+    proto_tree *tree, int offset, struct osiris_chunk_header *header)
+{
+    int ret;
+    guint32 remaining_bytes;
+
+    proto_tree *trailer_tree = proto_tree_add_subtree(tree, tvb, offset,
+        header->trailer_length, ett_osiris_trailer, NULL, "Trailer");
+
+    remaining_bytes = header->trailer_length;
+    do {
+        ret = dissect_osiris_trailer_entry(tvb, pinfo,
+            trailer_tree, offset, header);
+        if (ret < 0) {
+            return ret;
+        }
+
+        remaining_bytes -= (ret - offset);
+        offset = ret;
+    } while (remaining_bytes > 0);
 
     return offset;
 }
@@ -451,10 +516,10 @@ static int
 dissect_osiris_chunk(tvbuff_t *tvb, packet_info *pinfo,
     proto_tree *tree, void* data _U_)
 {
-    int ret;
-    gint offset = 0;
+    int ret, offset = 0;
     struct osiris_chunk_header header;
 
+    header.starting_offset = offset;
     header.version = tvb_get_guint8(tvb, offset) & 0x0f;
     header.chunk_type = tvb_get_guint8(tvb, offset + 1);
     header.num_entries = (guint)tvb_get_ntohs(tvb, offset + 2);
@@ -463,20 +528,20 @@ dissect_osiris_chunk(tvbuff_t *tvb, packet_info *pinfo,
     header.trailer_length = tvb_get_ntohl(tvb, offset + 40);
 
     col_set_str(pinfo->cinfo, COL_PROTOCOL, "Osiris");
-    col_clear(pinfo->cinfo,COL_INFO);
 
-    col_add_fstr(pinfo->cinfo, COL_INFO, "Chunk type '%s', %u entries",
+    col_clear(pinfo->cinfo,COL_INFO);
+    col_add_fstr(pinfo->cinfo, COL_INFO, "Chunk type '%s', %u entr%s",
         val_to_str(header.chunk_type, chunk_type_names,
         "Unknown chunk type (0x%02x)"),
-        header.num_entries);
+        header.num_entries, plurality(header.num_entries, "y", "ies"));
 
-    proto_item *ti = proto_tree_add_item(tree, proto_osiris, tvb, offset,
-        OSIRIS_CHUNK_HEADER_LENGTH + header.data_length +
+    proto_item *ti = proto_tree_add_item(tree, proto_osiris_chunk, tvb,
+        offset, OSIRIS_CHUNK_HEADER_LENGTH + header.data_length +
         header.trailer_length, ENC_NA);
-    proto_item_append_text(ti, ", chunk type '%s', %u entries",
+    proto_item_append_text(ti, ", chunk type '%s', %u entr%s",
         val_to_str(header.chunk_type, chunk_type_names,
         "unknown (0x%02x)"),
-        header.num_entries);
+        header.num_entries, plurality(header.num_entries, "y", "ies"));
 
     proto_tree *osiris_tree = proto_item_add_subtree(ti, ett_osiris);
     ret = dissect_osiris_chunk_header(tvb, pinfo, osiris_tree, offset);
@@ -496,6 +561,14 @@ dissect_osiris_chunk(tvbuff_t *tvb, packet_info *pinfo,
         ret = dissect_osiris_trailer(tvb, pinfo, osiris_tree, offset,
             &header);
         offset = (ret >= 0) ? ret : offset + header.trailer_length;
+    }
+
+    if (offset - header.starting_offset !=
+        OSIRIS_CHUNK_HEADER_LENGTH +
+        header.data_length +
+        header.trailer_length) {
+        expert_add_info(pinfo, ti,
+            &ei_osiris_inconsistent_chunk_size);
     }
 
     return offset;
@@ -541,50 +614,59 @@ static gboolean
 dissect_osiris_heur_file(tvbuff_t *tvb, packet_info *pinfo,
     proto_tree *tree, void *data)
 {
-    int ret;
-    gint offset, tvb_len, chunk_len;
+    int ret, count, offset, tvb_len, chunk_len;
     guint32 log_version;
 
     offset = 0;
 
     tvb_len = tvb_reported_length(tvb);
-    if (tvb_len <
-        OSIRIS_SEGMENT_FILE_HEADER_LENGTH + OSIRIS_CHUNK_HEADER_LENGTH) {
+    if (tvb_len < OSIRIS_SEGMENT_FILE_HEADER_LENGTH) {
         return FALSE;
     }
 
-    if (tvb_memeql(tvb, offset, (const guint8*)"OSIL", 5) != 0) {
+    if (tvb_memeql(tvb, offset, (const guint8*)"OSIL", 4) != 0) {
         return FALSE;
     }
     offset += 4;
+    tvb_len -= 4;
 
     log_version = tvb_get_ntohl(tvb, offset);
     if (log_version != 1) {
         return FALSE;
     }
     offset += 4;
+    tvb_len -= 4;
 
-    if (get_osiris_chunk_len(pinfo, tvb, offset, data) == 0) {
-        return FALSE;
+    proto_item *ti = proto_tree_add_item(tree, proto_osiris_log_file, tvb,
+        0, -1, ENC_NA);
+    proto_item_append_text(ti, ", version %d", log_version);
+
+    proto_tree *osiris_log_tree = proto_item_add_subtree(ti, ett_osiris_log);
+    proto_tree_add_item(osiris_log_tree, hf_osiris_log_magic, tvb, 0, 4,
+        ENC_BIG_ENDIAN);
+    proto_tree_add_item(osiris_log_tree, hf_osiris_log_version, tvb, 4, 4,
+        ENC_BIG_ENDIAN);
+
+    count = 0;
+    if (tvb_len >= OSIRIS_CHUNK_HEADER_LENGTH &&
+        get_osiris_chunk_len(pinfo, tvb, offset, data) > 0) {
+        do {
+            chunk_len = get_osiris_chunk_len(pinfo, tvb, offset, data);
+            if (chunk_len == 0) {
+                break;
+            }
+
+            tvbuff_t *subtvb = tvb_new_subset_length(tvb, offset, chunk_len);
+            ret = dissect_osiris_chunk(subtvb, pinfo, tree, data);
+
+            offset += chunk_len;
+            ++count;
+        } while (offset < tvb_len);
     }
 
-    do {
-        chunk_len = get_osiris_chunk_len(pinfo, tvb, offset, data);
-        if (chunk_len == 0) {
-            return FALSE;
-        }
-
-        tvbuff_t *subtvb = tvb_new_subset_length(tvb, offset, chunk_len);
-        ret = dissect_osiris_chunk(subtvb, pinfo, tree, data);
-
-        if (ret != chunk_len) {
-            /* TODO: Assert return value == chunk_len? */
-            fprintf(stderr, "Osiris chunk length (%d) doesn't match the "
-                "number of dissected bytes (%d)\n", chunk_len, ret);
-        }
-
-        offset += chunk_len;
-    } while (offset < tvb_len);
+    col_clear(pinfo->cinfo,COL_INFO);
+    col_add_fstr(pinfo->cinfo, COL_INFO, "Log file, %d chunk%s",
+        count, plurality(count, "", "s"));
 
     return TRUE;
 }
@@ -596,119 +678,119 @@ proto_register_osiris(void)
 
     static hf_register_info hf[] = {
         { &hf_osiris_magic,
-            { "Protocol magic", "osiris.magic",
+            { "Chunk magic", "osiris.chunk.magic",
                 FT_UINT8, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_version,
-            { "Protocol version", "osiris.version",
+            { "Chunk version", "osiris.chunk.version",
                 FT_UINT8, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_chunk_type,
-            { "Chunk type", "osiris.chunk_type",
+            { "Chunk type", "osiris.chunk.type",
                 FT_UINT8, BASE_HEX,
                 VALS(chunk_type_names), 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_num_entries,
-            { "Number of entries", "osiris.num_entries",
+            { "Number of entries", "osiris.chunk.num_entries",
                 FT_UINT16, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_num_records,
-            { "Number of records", "osiris.num_records",
+            { "Number of records", "osiris.chunk.num_records",
                 FT_UINT32, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_timestamp,
-            { "Timestamp", "osiris.timestamp",
+            { "Timestamp", "osiris.chunk.timestamp",
                 FT_ABSOLUTE_TIME, ABSOLUTE_TIME_UTC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_epoch,
-            { "Epoch", "osiris.epoch",
+            { "Epoch", "osiris.chunk.epoch",
                 FT_UINT64, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_chunk_first_offset,
-            { "Chunk first offset", "osiris.chunk_first_offset",
+            { "Chunk first offset", "osiris.chunk.first_offset",
                 FT_UINT64, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_chunk_crc,
-            { "Chunk CRC", "osiris.chunk_crc",
+            { "Chunk CRC", "osiris.chunk.crc",
                 FT_UINT32, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_data_length,
-            { "Data length", "osiris.data_length",
+            { "Data length", "osiris.chunk.data_length",
                 FT_UINT32, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_trailer_length,
-            { "Trailer length", "osiris.trailer_length",
+            { "Trailer length", "osiris.chunk.trailer_length",
                 FT_UINT32, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_entry_type,
-            { "Entry type", "osiris.entry.type",
+            { "Entry type", "osiris.chunk.entry.type",
                 FT_UINT8, BASE_HEX,
                 VALS(entry_type_names), 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_entry_data_size,
-            { "Entry data size", "osiris.entry.data_size",
+            { "Entry data size", "osiris.chunk.entry.data_size",
                 FT_UINT32, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_entry_data,
-            { "Entry data", "osiris.entry.data",
+            { "Entry data", "osiris.chunk.entry.data",
                 FT_BYTES, BASE_NONE,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_tracking_entry_id_size,
-            { "Tracking entry ID size", "osiris.tracking_entry.id_size",
+            { "Tracking entry ID size", "osiris.chunk.tracking_entry.id_size",
                 FT_UINT8, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_tracking_entry_id,
-            { "Tracking entry ID", "osiris.tracking_entry.id",
+            { "Tracking entry ID", "osiris.chunk.tracking_entry.id",
                 FT_BYTES, BASE_NONE,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_tracking_entry_offset,
-            { "Tracking entry offset", "osiris.tracking_entry.offset",
+            { "Tracking entry offset", "osiris.chunk.tracking_entry.offset",
                 FT_UINT64, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
@@ -716,7 +798,7 @@ proto_register_osiris(void)
 
         { &hf_osiris_subbatch_compression_type,
             { "Sub-batch compression type",
-                "osiris.subbatch.compression_type",
+                "osiris.chunk.subbatch.compression_type",
                 FT_UINT8, BASE_HEX,
                 NULL, 0x0,
                 NULL, HFILL }
@@ -724,7 +806,7 @@ proto_register_osiris(void)
 
         { &hf_osiris_subbatch_reserved,
             { "Sub-batch reserved bytes",
-                "osiris.subbatch.reserved_bytes",
+                "osiris.chunk.subbatch.reserved_bytes",
                 FT_BYTES, BASE_NONE,
                 NULL, 0x0,
                 NULL, HFILL }
@@ -732,36 +814,29 @@ proto_register_osiris(void)
 
         { &hf_osiris_subbatch_num_records,
             { "Sub-batch number of records",
-                "osiris.subbatch.num_records",
+                "osiris.chunk.subbatch.num_records",
                 FT_UINT16, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_trailer_writer_id_size,
-            { "Trailer writer ID size", "osiris.trailer.writer_id_size",
+            { "Trailer writer ID size", "osiris.chunk.trailer.writer_id_size",
                 FT_UINT8, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
         { &hf_osiris_trailer_writer_id,
-            { "Trailer writer ID", "osiris.trailer.writer_id",
+            { "Trailer writer ID", "osiris.chunk.trailer.writer_id",
                 FT_BYTES, BASE_NONE,
                 NULL, 0x0,
                 NULL, HFILL }
         },
 
-        { &hf_osiris_trailer_timestamp,
-            { "Trailer timestamp", "osiris.trailer.timestamp",
-                FT_ABSOLUTE_TIME, ABSOLUTE_TIME_UTC,
-                NULL, 0x0,
-                NULL, HFILL }
-        },
-
         { &hf_osiris_trailer_sequence,
-            { "Trailer sequence", "osiris.trailer.sequence",
-                FT_UINT32, BASE_DEC,
+            { "Trailer sequence", "osiris.chunk.trailer.sequence",
+                FT_UINT64, BASE_DEC,
                 NULL, 0x0,
                 NULL, HFILL }
         },
@@ -770,21 +845,46 @@ proto_register_osiris(void)
     static ei_register_info ei[] = {
         {
             &ei_osiris_invalid_chunk_type,
-            { "osiris.invalid_chunk_type", PI_PROTOCOL, PI_WARN,
+            { "osiris.chunk.invalid_chunk_type", PI_PROTOCOL, PI_WARN,
                 "Chunk type is invalid", EXPFILL }
         },
 
         {
             &ei_osiris_invalid_entry_type,
-            { "osiris.invalid_entry_type", PI_PROTOCOL, PI_WARN,
+            { "osiris.chunk.invalid_entry_type", PI_PROTOCOL, PI_WARN,
                 "Entry type is invalid", EXPFILL }
         },
 
         {
+            &ei_osiris_invalid_entry_type_for_chunk_type,
+            { "osiris.chunk.invalid_entry_type_for_chunk_type", PI_PROTOCOL,
+                PI_WARN,
+                "Entry type is invalid for this chunk type", EXPFILL }
+        },
+
+        {
+            &ei_osiris_chunk_content_overflow,
+            { "osiris.chunk.content_overflow", PI_PROTOCOL, PI_WARN,
+                "Chunk content overflows its length", EXPFILL }
+        },
+
+        {
             &ei_osiris_crc_mismatch,
-            { "osiris.crc_mismatch", PI_CHECKSUM, PI_WARN,
+            { "osiris.chunk.crc_mismatch", PI_CHECKSUM, PI_WARN,
                 "CRC mismatch", EXPFILL }
-        }
+        },
+
+        {
+            &ei_osiris_unknown_entry_content,
+            { "osiris.chunk.unknown_entry_content", PI_PROTOCOL, PI_NOTE,
+                "Unknown entry content", EXPFILL }
+        },
+
+        {
+            &ei_osiris_inconsistent_chunk_size,
+            { "osiris.chunk.inconsistent_chunk_size", PI_PROTOCOL, PI_WARN,
+                "Inconsistent chunk size", EXPFILL }
+        },
     };
 
     /* Setup protocol subtree array */
@@ -795,33 +895,62 @@ proto_register_osiris(void)
         &ett_osiris_entry,
         &ett_osiris_tracking_entry,
         &ett_osiris_trailer,
+        &ett_osiris_trailer_entry,
     };
 
-    proto_osiris = proto_register_protocol(
+    proto_osiris_chunk = proto_register_protocol(
         "Osiris Chunk",
-        "Osiris",
-        "osiris");
+        "Osiris chunk",
+        "osiris-chunk");
 
-    proto_register_field_array(proto_osiris, hf, array_length(hf));
-    expert_osiris = expert_register_protocol(proto_osiris);
+    proto_register_field_array(proto_osiris_chunk, hf, array_length(hf));
+    expert_osiris = expert_register_protocol(proto_osiris_chunk);
     expert_register_field_array(expert_osiris, ei, array_length(ei));
     proto_register_subtree_array(ett, array_length(ett));
 
-    register_dissector("osiris", dissect_osiris_tcp, proto_osiris);
+    static hf_register_info log_hf[] = {
+        { &hf_osiris_log_magic,
+            { "Segment file magic", "osiris.log.magic",
+                FT_STRING, BASE_NONE,
+                NULL, 0x0,
+                NULL, HFILL }
+        },
+
+        { &hf_osiris_log_version,
+            { "Segment file version", "osiris.log.version",
+                FT_UINT32, BASE_DEC,
+                NULL, 0x0,
+                NULL, HFILL }
+        },
+    };
+
+    static gint *log_ett[] = {
+        &ett_osiris_log,
+    };
+
+    proto_osiris_log_file = proto_register_protocol(
+        "Osiris Log File",
+        "Osiris log",
+        "osiris-log");
+
+    proto_register_field_array(proto_osiris_log_file,
+        log_hf, array_length(log_hf));
+    proto_register_subtree_array(log_ett, array_length(log_ett));
 }
 
 void
 proto_reg_handoff_osiris(void)
 {
-    dissector_handle_t osiris_handle;
+    dissector_handle_t osiris_handle, osiris_log_handle;
 
-    osiris_handle = find_dissector("osiris");
-
+    osiris_handle = create_dissector_handle(dissect_osiris_tcp,
+        proto_osiris_chunk);
     dissector_add_uint_range_with_preference(
         "tcp.port", OSIRIS_TCP_PORT_RANGE, osiris_handle);
 
+    osiris_log_handle = create_dissector_handle(NULL, proto_osiris_log_file);
     heur_dissector_add("wtap_file", dissect_osiris_heur_file,
-        "Osiris segment file", "osiris_wtap", proto_osiris,
+        "Osiris log file", "osiris_wtap", proto_osiris_log_file,
         HEURISTIC_ENABLE);
 }
 

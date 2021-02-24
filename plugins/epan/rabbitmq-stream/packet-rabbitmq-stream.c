@@ -255,7 +255,6 @@ dissect_rmqstream_frame(tvbuff_t *tvb, packet_info *pinfo,
     proto_tree *tree, int offset, gint frame_size,
     enum frame_keys frame_key, gint frame_version)
 {
-    fprintf(stderr, "Packet direction: %d\n", pinfo->p2p_dir);
     if (frame_props[frame_key].flags & F_EXPECT_RESPONSE) {
         if (frame_size == RESPONSE_MIN_SIZE) {
             /* Response frame. */
